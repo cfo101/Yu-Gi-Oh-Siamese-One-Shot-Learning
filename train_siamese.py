@@ -25,9 +25,8 @@ LR = 1e-4
 
 
 # ===============================================================
-# TRAINING DATA AUGMENTATION (mild, stable)
+# TRAINING DATA AUGMENTATION (mild → stable)
 # ===============================================================
-# Synthetic positives use this
 augment = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
     transforms.RandomRotation(8),
@@ -60,7 +59,7 @@ class SiameseDataset(Dataset):
             if not f.lower().endswith((".jpg", ".jpeg", ".png")):
                 continue
 
-            card_id = f.split("_")[0]  # no normalize; filenames already correct
+            card_id = f.split("_")[0]
 
             self.files.append(f)
             if card_id not in self.by_card:
@@ -79,7 +78,6 @@ class SiameseDataset(Dataset):
             return None
 
     def synthetic_positive(self, img):
-        """If only one real image exists, create augmented positive."""
         return augment(img)
 
     def __getitem__(self, idx):
@@ -89,7 +87,6 @@ class SiameseDataset(Dataset):
 
         anchor_img = self.load_image(anchor_path)
         if anchor_img is None:
-            # If corrupt image, randomly pick another index
             return self.__getitem__(random.randint(0, len(self)-1))
 
         # ---------------------------
@@ -98,18 +95,17 @@ class SiameseDataset(Dataset):
         same_card_images = self.by_card[anchor_id]
 
         if len(same_card_images) > 1:
-            # Real positive
             pos_filename = random.choice([f for f in same_card_images if f != anchor_filename])
             pos_img = self.load_image(os.path.join(self.root, pos_filename))
             if pos_img is None:
                 pos_img = self.synthetic_positive(anchor_img)
         else:
-            # Synthetic positive if only 1 real image exists
             pos_img = self.synthetic_positive(anchor_img)
 
         # ---------------------------
-        # NEGATIVE
+        # NEGATIVE (ignored for batch-hard)
         # ---------------------------
+        # We still sample one, but we won't use it directly
         neg_id = random.choice([cid for cid in self.card_ids if cid != anchor_id])
         neg_filename = random.choice(self.by_card[neg_id])
         neg_img = self.load_image(os.path.join(self.root, neg_filename))
@@ -117,11 +113,11 @@ class SiameseDataset(Dataset):
             return self.__getitem__(random.randint(0, len(self)-1))
 
         # ---------------------------
-        # CLIP preprocess
+        # Preprocess for CLIP
         # ---------------------------
         anchor_img = clip_preprocess(anchor_img)
         pos_img = clip_preprocess(pos_img)
-        neg_img = clip_preprocess(neg_img)
+        neg_img = clip_preprocess(neg_img)   # still returned (unused directly)
 
         return anchor_img, pos_img, neg_img
 
@@ -130,18 +126,17 @@ class SiameseDataset(Dataset):
 # MODEL
 # ===============================================================
 def build_model():
-    # Load CLIP encoder
     model, _, _ = open_clip.create_model_and_transforms(
         "ViT-B-16", pretrained="openai"
     )
     model = model.to(DEVICE)
-    model.eval()  # freeze encoder
+    model.eval()
 
-    # Freeze encoder parameters
+    # Freeze encoder
     for p in model.parameters():
         p.requires_grad = False
 
-    # Projection head (trainable)
+    # Trainable projection head
     proj = nn.Sequential(
         nn.Linear(512, 128),
         nn.ReLU(),
@@ -152,7 +147,7 @@ def build_model():
 
 
 # ===============================================================
-# TRAINING LOOP
+# TRAINING LOOP (Batch-Hard Negative Mining)
 # ===============================================================
 def train_siamese():
     print("Loading CLIP model...")
@@ -175,28 +170,38 @@ def train_siamese():
         loop = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         running_loss = 0.0
 
-        for anchor_img, pos_img, neg_img in loop:
+        for anchor_img, pos_img, _ in loop:
             anchor_img = anchor_img.to(DEVICE, non_blocking=True)
             pos_img = pos_img.to(DEVICE, non_blocking=True)
-            neg_img = neg_img.to(DEVICE, non_blocking=True)
 
             # ---------------------------
-            # Encode with frozen CLIP
+            # Encode with CLIP
             # ---------------------------
             with torch.no_grad():
                 a = model.encode_image(anchor_img)
                 p = model.encode_image(pos_img)
-                n = model.encode_image(neg_img)
 
-            # ---------------------------
-            # Project + Normalize (CRITICAL FIX)
-            # ---------------------------
+            # Project + normalize
             a = nn.functional.normalize(proj(a), dim=1)
             p = nn.functional.normalize(proj(p), dim=1)
-            n = nn.functional.normalize(proj(n), dim=1)
 
             # ---------------------------
-            # Triplet loss update
+            # BATCH-HARD NEGATIVE MINING
+            # ---------------------------
+            # Pairwise anchor distances (L2)
+            dist_matrix = torch.cdist(a, a, p=2)
+
+            # Mask out diagonal (self-distances)
+            mask = ~torch.eye(a.size(0), dtype=bool, device=DEVICE)
+
+            # Hardest negative index per anchor = closest other sample
+            hard_neg_idx = dist_matrix[mask].reshape(a.size(0), -1).argmin(dim=1)
+
+            # Hard negatives
+            n = a[hard_neg_idx]
+
+            # ---------------------------
+            # Triplet loss
             # ---------------------------
             loss = triplet_loss(a, p, n)
 
