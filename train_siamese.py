@@ -1,9 +1,9 @@
 from __future__ import annotations
 import os
 import random
+import math
 from typing import Optional
 from PIL import Image
-import numpy as np
 
 import torch
 import torch.nn as nn
@@ -20,12 +20,12 @@ TRAIN_DIR = os.path.join(DATA_DIR, "train")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BATCH_SIZE = 32
-EPOCHS = 10
+EPOCHS = 20        # increase for margin scheduling
 LR = 1e-4
 
 
 # ===============================================================
-# TRAINING DATA AUGMENTATION (mild → stable)
+# TRAINING AUGMENTATIONS (stable)
 # ===============================================================
 augment = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
@@ -56,15 +56,10 @@ class SiameseDataset(Dataset):
         self.by_card = {}
 
         for f in os.listdir(root_dir):
-            if not f.lower().endswith((".jpg", ".jpeg", ".png")):
-                continue
-
-            card_id = f.split("_")[0]
-
-            self.files.append(f)
-            if card_id not in self.by_card:
-                self.by_card[card_id] = []
-            self.by_card[card_id].append(f)
+            if f.lower().endswith((".jpg", ".jpeg", ".png")):
+                cid = f.split("_")[0]
+                self.files.append(f)
+                self.by_card.setdefault(cid, []).append(f)
 
         self.card_ids = list(self.by_card.keys())
 
@@ -81,45 +76,43 @@ class SiameseDataset(Dataset):
         return augment(img)
 
     def __getitem__(self, idx):
-        anchor_filename = self.files[idx]
-        anchor_id = anchor_filename.split("_")[0]
-        anchor_path = os.path.join(self.root, anchor_filename)
+        anchor_file = self.files[idx]
+        anchor_id = anchor_file.split("_")[0]
+        anchor_path = os.path.join(self.root, anchor_file)
 
         anchor_img = self.load_image(anchor_path)
         if anchor_img is None:
-            return self.__getitem__(random.randint(0, len(self)-1))
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
         # ---------------------------
         # POSITIVE
         # ---------------------------
-        same_card_images = self.by_card[anchor_id]
-
-        if len(same_card_images) > 1:
-            pos_filename = random.choice([f for f in same_card_images if f != anchor_filename])
-            pos_img = self.load_image(os.path.join(self.root, pos_filename))
+        same_imgs = self.by_card[anchor_id]
+        if len(same_imgs) > 1:
+            pos_file = random.choice([f for f in same_imgs if f != anchor_file])
+            pos_img = self.load_image(os.path.join(self.root, pos_file))
             if pos_img is None:
                 pos_img = self.synthetic_positive(anchor_img)
         else:
             pos_img = self.synthetic_positive(anchor_img)
 
         # ---------------------------
-        # NEGATIVE (ignored for batch-hard)
+        # NEGATIVE (unused for batch-hard)
         # ---------------------------
-        # We still sample one, but we won't use it directly
         neg_id = random.choice([cid for cid in self.card_ids if cid != anchor_id])
-        neg_filename = random.choice(self.by_card[neg_id])
-        neg_img = self.load_image(os.path.join(self.root, neg_filename))
+        neg_file = random.choice(self.by_card[neg_id])
+        neg_img = self.load_image(os.path.join(self.root, neg_file))
         if neg_img is None:
-            return self.__getitem__(random.randint(0, len(self)-1))
+            return self.__getitem__(random.randint(0, len(self) - 1))
 
         # ---------------------------
-        # Preprocess for CLIP
+        # Preprocess
         # ---------------------------
-        anchor_img = clip_preprocess(anchor_img)
-        pos_img = clip_preprocess(pos_img)
-        neg_img = clip_preprocess(neg_img)   # still returned (unused directly)
-
-        return anchor_img, pos_img, neg_img
+        return (
+            clip_preprocess(anchor_img),
+            clip_preprocess(pos_img),
+            clip_preprocess(neg_img),
+        )
 
 
 # ===============================================================
@@ -132,7 +125,7 @@ def build_model():
     model = model.to(DEVICE)
     model.eval()
 
-    # Freeze encoder
+    # Freeze CLIP encoder
     for p in model.parameters():
         p.requires_grad = False
 
@@ -147,7 +140,16 @@ def build_model():
 
 
 # ===============================================================
-# TRAINING LOOP (Batch-Hard Negative Mining)
+# MARGIN SCHEDULING (cosine)
+# ===============================================================
+def compute_margin(epoch, total_epochs, m_min=0.10, m_max=0.60):
+    """Cosine-annealed margin schedule."""
+    progress = epoch / total_epochs
+    return m_min + 0.5 * (m_max - m_min) * (1 - math.cos(math.pi * progress))
+
+
+# ===============================================================
+# TRAINING LOOP (Batch-Hard + Scheduled Margin)
 # ===============================================================
 def train_siamese():
     print("Loading CLIP model...")
@@ -163,12 +165,17 @@ def train_siamese():
     )
 
     optimizer = torch.optim.Adam(proj.parameters(), lr=LR)
-    triplet_loss = nn.TripletMarginLoss(margin=0.3)
 
     print("Starting training...")
     for epoch in range(EPOCHS):
         loop = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         running_loss = 0.0
+
+        # Dynamic margin for this epoch
+        margin = compute_margin(epoch, EPOCHS)
+        triplet_loss = nn.TripletMarginLoss(margin=margin)
+
+        print(f"Using margin = {margin:.4f}")
 
         for anchor_img, pos_img, _ in loop:
             anchor_img = anchor_img.to(DEVICE, non_blocking=True)
@@ -188,16 +195,9 @@ def train_siamese():
             # ---------------------------
             # BATCH-HARD NEGATIVE MINING
             # ---------------------------
-            # Pairwise anchor distances (L2)
             dist_matrix = torch.cdist(a, a, p=2)
-
-            # Mask out diagonal (self-distances)
             mask = ~torch.eye(a.size(0), dtype=bool, device=DEVICE)
-
-            # Hardest negative index per anchor = closest other sample
             hard_neg_idx = dist_matrix[mask].reshape(a.size(0), -1).argmin(dim=1)
-
-            # Hard negatives
             n = a[hard_neg_idx]
 
             # ---------------------------
