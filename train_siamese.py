@@ -12,21 +12,17 @@ from torchvision import transforms
 import open_clip
 from tqdm import tqdm
 
-# ===============================================================
-# CONFIG
-# ===============================================================
+
 DATA_DIR = "dataset_split"
 TRAIN_DIR = os.path.join(DATA_DIR, "train")
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 BATCH_SIZE = 32
-EPOCHS = 20        # increase for margin scheduling
+EPOCHS = 20        
 LR = 1e-4
 
 
-# ===============================================================
-# TRAINING AUGMENTATIONS (stable)
-# ===============================================================
+#training augmentations
 augment = transforms.Compose([
     transforms.RandomResizedCrop(224, scale=(0.8, 1.0)),
     transforms.RandomRotation(8),
@@ -34,9 +30,7 @@ augment = transforms.Compose([
 ])
 
 
-# ===============================================================
-# CLIP PREPROCESS
-# ===============================================================
+#preprocess
 def load_clip_transform():
     _, _, preprocess = open_clip.create_model_and_transforms(
         "ViT-B-16", pretrained="openai"
@@ -46,9 +40,7 @@ def load_clip_transform():
 clip_preprocess = load_clip_transform()
 
 
-# ===============================================================
-# DATASET
-# ===============================================================
+#dataset
 class SiameseDataset(Dataset):
     def __init__(self, root_dir):
         self.root = root_dir
@@ -84,9 +76,7 @@ class SiameseDataset(Dataset):
         if anchor_img is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
-        # ---------------------------
-        # POSITIVE
-        # ---------------------------
+        #positives
         same_imgs = self.by_card[anchor_id]
         if len(same_imgs) > 1:
             pos_file = random.choice([f for f in same_imgs if f != anchor_file])
@@ -96,18 +86,14 @@ class SiameseDataset(Dataset):
         else:
             pos_img = self.synthetic_positive(anchor_img)
 
-        # ---------------------------
-        # NEGATIVE (unused for batch-hard)
-        # ---------------------------
+        #negatives
         neg_id = random.choice([cid for cid in self.card_ids if cid != anchor_id])
         neg_file = random.choice(self.by_card[neg_id])
         neg_img = self.load_image(os.path.join(self.root, neg_file))
         if neg_img is None:
             return self.__getitem__(random.randint(0, len(self) - 1))
 
-        # ---------------------------
-        # Preprocess
-        # ---------------------------
+        
         return (
             clip_preprocess(anchor_img),
             clip_preprocess(pos_img),
@@ -115,9 +101,7 @@ class SiameseDataset(Dataset):
         )
 
 
-# ===============================================================
-# MODEL
-# ===============================================================
+#MODEL
 def build_model():
     model, _, _ = open_clip.create_model_and_transforms(
         "ViT-B-16", pretrained="openai"
@@ -139,18 +123,14 @@ def build_model():
     return model, proj
 
 
-# ===============================================================
-# MARGIN SCHEDULING (cosine)
-# ===============================================================
+
 def compute_margin(epoch, total_epochs, m_min=0.10, m_max=0.60):
     """Cosine-annealed margin schedule."""
     progress = epoch / total_epochs
     return m_min + 0.5 * (m_max - m_min) * (1 - math.cos(math.pi * progress))
 
 
-# ===============================================================
-# TRAINING LOOP (Batch-Hard + Scheduled Margin)
-# ===============================================================
+
 def train_siamese():
     print("Loading CLIP model...")
     model, proj = build_model()
@@ -181,9 +161,7 @@ def train_siamese():
             anchor_img = anchor_img.to(DEVICE, non_blocking=True)
             pos_img = pos_img.to(DEVICE, non_blocking=True)
 
-            # ---------------------------
-            # Encode with CLIP
-            # ---------------------------
+            
             with torch.no_grad():
                 a = model.encode_image(anchor_img)
                 p = model.encode_image(pos_img)
@@ -192,17 +170,13 @@ def train_siamese():
             a = nn.functional.normalize(proj(a), dim=1)
             p = nn.functional.normalize(proj(p), dim=1)
 
-            # ---------------------------
-            # BATCH-HARD NEGATIVE MINING
-            # ---------------------------
+            
             dist_matrix = torch.cdist(a, a, p=2)
             mask = ~torch.eye(a.size(0), dtype=bool, device=DEVICE)
             hard_neg_idx = dist_matrix[mask].reshape(a.size(0), -1).argmin(dim=1)
             n = a[hard_neg_idx]
 
-            # ---------------------------
-            # Triplet loss
-            # ---------------------------
+           
             loss = triplet_loss(a, p, n)
 
             optimizer.zero_grad()
@@ -217,8 +191,5 @@ def train_siamese():
     print("Projection head saved.")
 
 
-# ===============================================================
-# MAIN
-# ===============================================================
 if __name__ == "__main__":
     train_siamese()
