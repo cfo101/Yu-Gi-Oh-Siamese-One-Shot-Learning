@@ -27,7 +27,7 @@ Performance:
 
 Using the trained projection head + OCR fusion:
 
-Dataset	Top-1 Accuracy	Top-5 Accuracy
+Dataset Top-1 Accuracy	Top-5 Accuracy
 Validation	96.39%	99.16%
 Test (harder augmentations)	80.26%	89.36%
 
